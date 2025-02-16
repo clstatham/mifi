@@ -1,4 +1,3 @@
-/data/**/*.wav
+/data
 /models
 /results
-data/test.zip
