@@ -1,48 +1,47 @@
 import torch
 import torchaudio
+import torchvision
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
+
+from datetime import datetime
 import os
 from tqdm import tqdm
 
-N_FFT = 128
+N_FFT = 512
 HOP_LENGTH = N_FFT // 4
-BATCH_SIZE = 8
-HIDDEN_DIM = 64
-LR = 0.01
+BATCH_SIZE = 16
+HIDDEN_SIZE = 512
+LR = 0.005
 WINDOW_FN = torch.hann_window
 
 N_BINS = N_FFT // 2 + 1
 WINDOW = WINDOW_FN(N_FFT)
 
 
-def log_transform(waveform):
-    return torch.log1p(waveform)
-
-
-def inv_log_transform(log_waveform):
-    return torch.expm1(log_waveform)
-
-
 def stft_transform(waveform):
     stft = torch.stft(waveform, n_fft=N_FFT, hop_length=HOP_LENGTH, window=WINDOW.to(waveform.device), return_complex=True)
     mag = torch.abs(stft)
     phase = torch.angle(stft)
-    mag = log_transform(mag)
     return torch.stack([mag, phase], dim=-1)
 
 
 def istft_transform(stft):
     mag = stft[..., 0]
     phase = stft[..., 1]
-    mag = inv_log_transform(mag)
     stft = torch.polar(mag, phase)
     stft = stft.squeeze(1)
     waveform = torch.istft(stft, n_fft=N_FFT, hop_length=HOP_LENGTH, window=WINDOW.to(stft.device))
     return waveform
+
+
+def save_ratio_image(tensor, filename):
+    tensor = tensor.squeeze(0).cpu()
+    tensor = torchvision.transforms.ToPILImage()(tensor)
+    tensor.save(filename)
 
 
 class AudioDataset(Dataset):
@@ -53,7 +52,6 @@ class AudioDataset(Dataset):
         x_files = os.listdir(x_dir)
         y_files = os.listdir(y_dir)
 
-        assert len(x_files) == len(y_files), f"Number of input files ({len(x_files)}) and output files ({len(y_files)}) must be equal"
         self.x_files = x_files
         self.y_files = y_files
         self.transform = transform
@@ -72,61 +70,64 @@ class AudioDataset(Dataset):
         x = stft_transform(x_waveform)
         y = stft_transform(y_waveform)
 
-        noise = log_transform(F.relu(inv_log_transform(x[..., 0]) - inv_log_transform(y[..., 0])))
+        noise = F.relu(x[..., 0] - y[..., 0])
+        noise_ratio = torch.where(x[..., 0] > 0, noise / x[..., 0], torch.zeros_like(noise))
         noise = torch.stack([noise, x[..., 1]], dim=-1)
 
         x = x.squeeze(0)
         y = y.squeeze(0)
         noise = noise.squeeze(0)
+        noise_ratio = noise_ratio.squeeze(0)
 
-        return x, y, noise
+        return x, y, noise, noise_ratio
 
 
 class MifiNoisePredictor(nn.Module):
     def __init__(self):
         super(MifiNoisePredictor, self).__init__()
 
-        self.fc1 = nn.Linear(N_BINS, 128)
-
-        self.conv1 = nn.Conv1d(128, 512, 5, stride=1, padding=4)
-        self.conv2 = nn.Conv1d(512, 512, 3, stride=1, padding=2)
-
-        self.gru1 = nn.GRU(512, 512, 1, batch_first=True)
-        self.gru2 = nn.GRU(512, 512, 1, batch_first=True)
-        self.gru3 = nn.GRU(512, 512, 1, batch_first=True)
-
-        self.fc2 = nn.Linear(512 * 3, N_BINS)
+        self.fc1 = nn.Linear(N_BINS, HIDDEN_SIZE)
+        self.hidden = nn.GRU(HIDDEN_SIZE, HIDDEN_SIZE, num_layers=2, batch_first=True, bidirectional=False)
+        self.fc2 = nn.Linear(HIDDEN_SIZE, N_BINS)
 
     def forward(self, x):
+        with torch.no_grad():
+            x = torch.log1p(x)
+            x = (x - x.mean(dim=-1, keepdim=True)) / x.std(dim=-1, keepdim=True)  # normalize to mean 0, std 1
         x = x.permute(0, 2, 1)
         x = F.relu(self.fc1(x))
-        x = x.permute(0, 2, 1)
-        x = F.relu(self.conv1(x))
-        x = x[..., :-4]
-        x = torch.tanh(self.conv2(x))
-        x = x[..., :-2]
-        x = x.permute(0, 2, 1)
-        gru1_out, _ = self.gru1(x)
-        gru2_out, _ = self.gru2(gru1_out)
-        gru3_out, _ = self.gru3(gru2_out)
-        x = torch.cat([gru1_out, gru2_out, gru3_out], dim=-1)
-        x = self.fc2(x)
+        x, _ = self.hidden(x)
+        x = F.sigmoid(self.fc2(x))
         x = x.permute(0, 2, 1)
         return x
 
 
 def train_model(model, train_dataloader, test_dataloader, criterion, optimizer, num_epochs):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    root = os.path.join("training", timestamp)
+    if not os.path.exists(root):
+        os.makedirs(root)
+    log_file = open(os.path.join(root, "log.txt"), "w")
+
+    log_file.write(f"Training run {timestamp}\n")
+    log_file.write(f"Batch size: {BATCH_SIZE}\n")
+    log_file.write(f"Learning rate: {LR}\n")
+    log_file.write(f"Hidden size: {HIDDEN_SIZE}\n")
+    log_file.write(f"STFT parameters: N_FFT={N_FFT}, HOP_LENGTH={HOP_LENGTH}\n")
+    log_file.write("-" * 80 + "\n")
+
     for epoch in range(num_epochs):
         model.train()
         losses = []
         progbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")
-        for x, y, noise in progbar:
+        for x, y, noise, noise_ratio in progbar:
             x = x.to(device)[..., 0]
             y = y.to(device)[..., 0]
             noise = noise.to(device)[..., 0]
+            noise_ratio = noise_ratio.to(device)
             optimizer.zero_grad()
             pred_noise = model(x)
-            loss = criterion(pred_noise, noise)
+            loss = criterion(pred_noise, noise_ratio)
             loss.backward()
             optimizer.step()
             current_loss = loss.item()
@@ -134,29 +135,34 @@ def train_model(model, train_dataloader, test_dataloader, criterion, optimizer, 
             losses.append(loss.item())
         loss = torch.tensor(losses).mean()
         print(f"Epoch {epoch+1}/{num_epochs}, Loss: {loss.item()}")
+        log_file.write(f"Epoch {epoch+1}/{num_epochs}, Loss: {loss.item()}\n")
 
         model.eval()
         losses = []
         with torch.no_grad():
-            for x, y, noise in test_dataloader:
+            for x, y, noise, noise_ratio in test_dataloader:
                 x = x.to(device)[..., 0]
                 y = y.to(device)[..., 0]
                 noise = noise.to(device)[..., 0]
+                noise_ratio = noise_ratio.to(device)
                 pred_noise = model(x)
-                loss = criterion(pred_noise, noise)
+                loss = criterion(pred_noise, noise_ratio)
                 losses.append(loss.item())
             loss = torch.tensor(losses).mean()
             print(f"Validation Loss: {loss.item()}")
+            log_file.write(f"Validation Loss: {loss.item()}\n")
 
-            if not os.path.exists("models"):
-                os.makedirs("models")
-            torch.save(model.state_dict(), f"models/model_{epoch+1}.pt")
+            model_dir = os.path.join(root, "models")
+            if not os.path.exists(model_dir):
+                os.makedirs(model_dir)
+            torch.save(model.state_dict(), os.path.join(model_dir, f"model_{epoch+1}.pt"))
             print(f"Model saved as model_{epoch+1}.pt")
 
-            if not os.path.exists("results"):
-                os.makedirs("results")
+            results_dir = os.path.join(root, "results", f"epoch_{epoch+1}")
+            if not os.path.exists(results_dir):
+                os.makedirs(results_dir)
 
-            x, y, noise = next(iter(test_dataloader))
+            x, y, noise, noise_ratio = next(iter(test_dataloader))
             x = x.to(device)
             y = y.to(device)
             noise = noise.to(device)
@@ -164,45 +170,52 @@ def train_model(model, train_dataloader, test_dataloader, criterion, optimizer, 
             x_waveform = istft_transform(x)
             y_waveform = istft_transform(y)
 
-            pred_noise = model(x[..., 0])
+            pred_noise_ratio = model(x[..., 0])
+            pred_noise = pred_noise_ratio * x[..., 0]
             pred_noise_waveform = istft_transform(torch.stack([pred_noise, x[..., 1]], dim=-1))
 
-            denoised = log_transform(F.relu(inv_log_transform(x[..., 0]) - inv_log_transform(pred_noise)))
-            denoised = torch.stack([denoised, x[..., 1]], dim=-1)
-            denoised_waveform = istft_transform(denoised)
+            denoised = F.relu(x[..., 0] - pred_noise)
+            denoised_waveform = istft_transform(torch.stack([denoised, x[..., 1]], dim=-1))
 
             noise = istft_transform(noise)
 
-            try:
-                for i in range(BATCH_SIZE):
-                    torchaudio.save(f"results/epoch_{epoch+1}_sample_{i}_input.wav", x_waveform.cpu()[i : i + 1], 16000)
-                    torchaudio.save(f"results/epoch_{epoch+1}_sample_{i}_target.wav", y_waveform.cpu()[i : i + 1], 16000)
-                    torchaudio.save(f"results/epoch_{epoch+1}_sample_{i}_output.wav", pred_noise_waveform.cpu()[i : i + 1], 16000)
-                    torchaudio.save(f"results/epoch_{epoch+1}_sample_{i}_denoised.wav", denoised_waveform.cpu()[i : i + 1], 16000)
-                    torchaudio.save(f"results/epoch_{epoch+1}_sample_{i}_noise.wav", noise.cpu()[i : i + 1], 16000)
-
-            except Exception as e:
-                print(f"Error saving samples: {e}")
+            for i in range(min(BATCH_SIZE, 5)):
+                try:
+                    torchaudio.save(os.path.join(results_dir, f"{i}_input.wav"), x_waveform.cpu()[i : i + 1], 16000)
+                    torchaudio.save(os.path.join(results_dir, f"{i}_target.wav"), y_waveform.cpu()[i : i + 1], 16000)
+                    torchaudio.save(os.path.join(results_dir, f"{i}_output.wav"), pred_noise_waveform.cpu()[i : i + 1], 16000)
+                    torchaudio.save(os.path.join(results_dir, f"{i}_denoised.wav"), denoised_waveform.cpu()[i : i + 1], 16000)
+                    torchaudio.save(os.path.join(results_dir, f"{i}_noise.wav"), noise.cpu()[i : i + 1], 16000)
+                    save_ratio_image(noise_ratio.cpu()[i : i + 1], os.path.join(results_dir, f"{i}_noise_ratio.png"))
+                    save_ratio_image(pred_noise_ratio.cpu()[i : i + 1], os.path.join(results_dir, f"{i}_pred_noise_ratio.png"))
+                except Exception as e:
+                    print(f"Error saving samples: {e}")
             print(f"Sample results saved for epoch {epoch+1}")
+
+        log_file.write("-" * 80 + "\n")
 
 
 def collate_fn(batch):
-    x, y, noise = zip(*batch)
+    x, y, noise, noise_ratio = zip(*batch)
     max_length = max([x_.shape[-2] for x_ in x])
     xs = []
     ys = []
     noises = []
-    for x_, y_, noise_ in zip(x, y, noise):
+    noise_ratios = []
+    for x_, y_, noise_, noise_ratio_ in zip(x, y, noise, noise_ratio):
         x_ = F.pad(x_, (0, 0, max_length - x_.shape[-2], 0))
         y_ = F.pad(y_, (0, 0, max_length - y_.shape[-2], 0))
         noise_ = F.pad(noise_, (0, 0, max_length - noise_.shape[-2], 0))
+        noise_ratio_ = F.pad(noise_ratio_, (0, max_length - noise_ratio_.shape[-1]))
         xs.append(x_)
         ys.append(y_)
         noises.append(noise_)
+        noise_ratios.append(noise_ratio_)
     x = torch.stack(xs)
     y = torch.stack(ys)
     noise = torch.stack(noises)
-    return x, y, noise
+    noise_ratio = torch.stack(noise_ratios)
+    return x, y, noise, noise_ratio
 
 
 if __name__ == "__main__":
@@ -219,7 +232,7 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = MifiNoisePredictor().to(device)
-    criterion = nn.L1Loss()
+    criterion = nn.BCELoss()
     optimizer = optim.Adam(model.parameters(), lr=LR)
 
-    train_model(model, train_dataloader, test_dataloader, criterion, optimizer, num_epochs=100)
+    train_model(model, train_dataloader, test_dataloader, criterion, optimizer, num_epochs=1000)
